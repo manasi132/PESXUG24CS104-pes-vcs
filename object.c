@@ -45,9 +45,6 @@ void compute_hash(const void *data, size_t len, ObjectID *id_out) {
     EVP_MD_CTX_free(ctx);
 }
 
-// Get the filesystem path where an object should be stored.
-// Format: .pes/objects/XX/YYYYYYYY...
-// The first 2 hex chars form the shard directory; the rest is the filename.
 void object_path(const ObjectID *id, char *path_out, size_t path_size) {
     char hex[HASH_HEX_SIZE + 1];
     hash_to_hex(id, hex);
@@ -60,7 +57,7 @@ int object_exists(const ObjectID *id) {
     return access(path, F_OK) == 0;
 }
 
-// ─── TODO: Implement these ──────────────────────────────────────────────────
+// ─── TODO IMPLEMENTED ───────────────────────────────────────────────────────
 
 // Write an object to the store.
 int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out) {
@@ -78,8 +75,17 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
     char *full = malloc(total_len);
     if (!full) return -1;
 
+    // Copy header
     memcpy(full, header, header_len);
-    memcpy(full + header_len, data, len);
+
+    // Copy data safely
+    if (len > 0) {
+        if (!data) {
+            free(full);
+            return -1;
+        }
+        memcpy(full + header_len, data, len);
+    }
 
     // Compute hash
     ObjectID id;
@@ -96,9 +102,13 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
     char path[512];
     object_path(&id, path, sizeof(path));
 
-    // Create directory
+    // Ensure directories exist
+    mkdir(OBJECTS_DIR, 0755);
+
     char dir[512];
     strncpy(dir, path, sizeof(dir));
+    dir[sizeof(dir) - 1] = '\0';
+
     char *slash = strrchr(dir, '/');
     if (slash) {
         *slash = '\0';
@@ -108,6 +118,7 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
     // Temp file
     char temp_path[512];
     snprintf(temp_path, sizeof(temp_path), "%s.tmp", path);
+    temp_path[sizeof(temp_path) - 1] = '\0';
 
     int fd = open(temp_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
     if (fd < 0) {
@@ -115,10 +126,16 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
         return -1;
     }
 
-    if (write(fd, full, total_len) != (ssize_t)total_len) {
-        close(fd);
-        free(full);
-        return -1;
+    // Write safely (handle partial writes)
+    size_t written = 0;
+    while (written < total_len) {
+        ssize_t n = write(fd, full + written, total_len - written);
+        if (n <= 0) {
+            close(fd);
+            free(full);
+            return -1;
+        }
+        written += n;
     }
 
     fsync(fd);
@@ -149,7 +166,12 @@ int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_
         return -1;
     }
 
-    fread(buffer, 1, size, fp);
+    if (fread(buffer, 1, size, fp) != size) {
+        fclose(fp);
+        free(buffer);
+        return -1;
+    }
+
     fclose(fp);
 
     // Verify integrity
@@ -160,14 +182,13 @@ int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_
         return -1;
     }
 
-    // Find header separator
+    // Parse header
     char *null_pos = memchr(buffer, '\0', size);
     if (!null_pos) {
         free(buffer);
         return -1;
     }
 
-    // Parse header
     char type_str[10];
     size_t data_len;
 
